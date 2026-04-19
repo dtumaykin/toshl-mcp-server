@@ -1,8 +1,9 @@
 import winston from 'winston';
 
 /**
- * Sets up the logger for the application
- * @returns Winston logger instance
+ * Sets up the logger for the application.
+ * IMPORTANT: MCP stdio servers use stdout for JSON-RPC protocol messages.
+ * All logs MUST go to stderr, or the client will fail to parse them as protocol.
  */
 export function setupLogger() {
     const logLevel = process.env.LOG_LEVEL || 'info';
@@ -16,8 +17,8 @@ export function setupLogger() {
         defaultMeta: { service: 'toshl-mcp-server' },
         transports: [
             new winston.transports.Console({
+                stderrLevels: ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'],
                 format: winston.format.combine(
-                    winston.format.colorize(),
                     winston.format.simple()
                 )
             })
@@ -27,7 +28,5 @@ export function setupLogger() {
     return logger;
 }
 
-// Create a default logger instance
 const logger = setupLogger();
-
 export default logger;
