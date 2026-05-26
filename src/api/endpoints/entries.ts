@@ -85,7 +85,7 @@ export class EntriesClient {
         };
 
         // Make sure all required fields are present
-        if (!updatedEntry.amount || !updatedEntry.currency || !updatedEntry.date ||
+        if (typeof updatedEntry.amount !== 'number' || !updatedEntry.currency || !updatedEntry.date ||
             !updatedEntry.account || !updatedEntry.category || !updatedEntry.modified) {
             throw new Error('Missing required fields for updating entry');
         }

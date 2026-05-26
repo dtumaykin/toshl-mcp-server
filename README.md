@@ -190,6 +190,38 @@ The server can be configured using environment variables:
 - `CACHE_ENABLED`: Whether caching is enabled (default: true)
 - `LOG_LEVEL`: Logging level (default: info)
 
+## Safety controls
+
+This fork adds two safety mechanisms for anyone running the server against a real Toshl account — in particular when a scheduled agent (e.g. Cowork) is calling the tools unattended.
+
+### Environment variables
+
+- `TOSHL_ALLOW_DELETE` (default: `false`). Must be exactly the string `true` to enable any operation that deletes a Toshl entry.
+  - When `false`, the `entry_delete` tool is **not registered** — it does not appear in the tool list returned to the MCP client.
+  - When `false`, `entry_convert_to_transfer` is also not listed, because the conversion deletes the original entry.
+  - If a caller invokes either tool anyway, the call is refused with an error and a `delete_blocked` / `convert_blocked` record is appended to the audit log.
+- `TOSHL_AUDIT_LOG` (default: `~/.toshl-mcp/audit.log`, with `~` expanded to the home directory). File path for the audit log. The parent directory is created at startup if it does not exist.
+
+### Batch preview / commit flow
+
+Write operations (`create`, `update`, `manage`) are not exposed as individual tools. Instead, they go through a two-step flow:
+
+1. `entry_batch_preview` — accepts an `operations` array of `{ action, data }` items, validates every operation, generates a UUID confirmation token (5-minute expiry), appends a `preview` record to the audit log, and returns the token plus the normalised operations and a count summary (e.g. `"3 creates, 1 update"`). No Toshl API call is made.
+2. `entry_batch_commit` — accepts the `confirmation_token` returned by preview, marks the token used (preventing replay), executes each operation in order, and returns a per-operation result list. A single failed operation does not abort the rest; the response is honest about partial success.
+
+Single-entry edits are expressed as a batch of one — the flow is the same for interactive use and scheduled use.
+
+### Audit log
+
+Every preview, commit, and blocked-delete / blocked-convert call appends one JSON line (JSON Lines) to the audit log. Fields:
+
+- `timestamp` — ISO 8601
+- `event` — `preview` | `commit` | `delete_blocked` | `convert_blocked`
+- `token` — the confirmation token (nullable)
+- `payload` — the operation details or error context
+
+Writes are synchronous `appendFileSync` calls so the record hits disk before (or very shortly after) the corresponding Toshl API call fires.
+
 ## License
 
 MIT

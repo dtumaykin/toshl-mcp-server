@@ -1,24 +1,255 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { createEntriesClient } from '../api/endpoints/entries.js';
-import { ToshlTransaction } from '../utils/types.js';
 import logger from '../utils/logger.js';
+import { isDeleteAllowed } from '../utils/safety.js';
+import { logAudit } from '../utils/audit-log.js';
+import { createBatch, claimBatch, BatchOperation } from '../utils/batch-store.js';
+import { getTransferCategoryId } from '../utils/transfer-category.js';
+
+/* ------------------------------------------------------------------------- */
+/* Tool schemas                                                              */
+/* ------------------------------------------------------------------------- */
+
+const entryCreateDataSchema = {
+    type: 'object',
+    properties: {
+        amount: {
+            type: 'number',
+            description: 'Entry amount (negative for expense, positive for income)',
+        },
+        currency: {
+            type: 'object',
+            description: 'Currency object',
+            properties: {
+                code: { type: 'string', description: 'Currency code (e.g., USD, EUR)' },
+                rate: { type: 'number', description: 'Exchange rate' },
+                fixed: { type: 'boolean', description: 'Whether the exchange rate is fixed' },
+            },
+            required: ['code'],
+        },
+        date: { type: 'string', description: 'Entry date (YYYY-MM-DD)' },
+        desc: { type: 'string', description: 'Entry description' },
+        account: { type: 'string', description: 'Account ID' },
+        category: { type: 'string', description: 'Category ID' },
+        tags: { type: 'array', description: 'Array of tag IDs', items: { type: 'string' } },
+        transaction: {
+            type: 'object',
+            description: 'Transaction object for transfers between accounts',
+            properties: {
+                account: { type: 'string' },
+                currency: {
+                    type: 'object',
+                    properties: { code: { type: 'string' } },
+                    required: ['code'],
+                },
+            },
+            required: ['account', 'currency'],
+        },
+    },
+    required: ['amount', 'currency', 'date', 'account', 'category'],
+};
+
+const entryUpdateDataSchema = {
+    type: 'object',
+    properties: {
+        id: { type: 'string', description: 'Entry ID' },
+        amount: { type: 'number' },
+        currency: {
+            type: 'object',
+            properties: {
+                code: { type: 'string' },
+                rate: { type: 'number' },
+                fixed: { type: 'boolean' },
+            },
+            required: ['code'],
+        },
+        date: { type: 'string' },
+        desc: { type: 'string' },
+        account: { type: 'string' },
+        category: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        updateMode: { type: 'string', enum: ['all', 'one', 'tail'] },
+    },
+    required: ['id'],
+};
+
+const entryManageDataSchema = {
+    type: 'object',
+    properties: {
+        with: {
+            type: 'object',
+            properties: {
+                tags: { type: 'array', items: { type: 'string' } },
+                accounts: { type: 'array', items: { type: 'string' } },
+                categories: { type: 'array', items: { type: 'string' } },
+                description: { type: 'string' },
+            },
+        },
+        set: {
+            type: 'object',
+            properties: {
+                tags: { type: 'array', items: { type: 'string' } },
+                account: { type: 'string' },
+                category: { type: 'string' },
+            },
+        },
+        add: {
+            type: 'object',
+            properties: { tags: { type: 'array', items: { type: 'string' } } },
+        },
+        remove: {
+            type: 'object',
+            properties: { tags: { type: 'array', items: { type: 'string' } } },
+        },
+    },
+    required: ['with'],
+};
 
 /**
- * Sets up entry tools
- * @returns List of entry tools
+ * Sets up entry tools. The set of tools depends on runtime config:
+ *   - entry_delete is only listed when TOSHL_ALLOW_DELETE=true.
+ *   - entry_convert_to_transfer is only listed when TOSHL_ALLOW_DELETE=true
+ *     (the conversion deletes the original entry).
+ *   - entry_create / entry_update / entry_manage are never listed directly;
+ *     callers go through entry_batch_preview + entry_batch_commit.
  */
 export function setupEntryTools() {
-    return [
+    const deleteAllowed = isDeleteAllowed();
+
+    const tools: any[] = [
         {
+            name: 'entry_list',
+            description: 'List entries in Toshl Finance',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    from: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+                    to: { type: 'string', description: 'End date (YYYY-MM-DD)' },
+                    type: { type: 'string', description: 'Entry type (expense, income, transaction)' },
+                    accounts: { type: 'string', description: 'Comma-separated account IDs' },
+                    categories: { type: 'string', description: 'Comma-separated category IDs' },
+                    tags: { type: 'string', description: 'Comma-separated tag IDs' },
+                    search: { type: 'string', description: 'Search term' },
+                },
+                required: ['from', 'to'],
+            },
+        },
+        {
+            name: 'entry_get',
+            description: 'Get details of a specific entry in Toshl Finance',
+            inputSchema: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Entry ID' } },
+                required: ['id'],
+            },
+        },
+        {
+            name: 'entry_sums',
+            description: 'Get daily sums of entries in Toshl Finance',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    from: { type: 'string' },
+                    to: { type: 'string' },
+                    currency: { type: 'string' },
+                    accounts: { type: 'string' },
+                    categories: { type: 'string' },
+                    tags: { type: 'string' },
+                    range: { type: 'string' },
+                    type: { type: 'string' },
+                },
+                required: ['from', 'to', 'currency'],
+            },
+        },
+        {
+            name: 'entry_timeline',
+            description: 'Get timeline of entries in Toshl Finance',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    from: { type: 'string' },
+                    to: { type: 'string' },
+                    accounts: { type: 'string' },
+                    categories: { type: 'string' },
+                    tags: { type: 'string' },
+                },
+                required: ['from', 'to'],
+            },
+        },
+        {
+            name: 'entry_batch_preview',
+            description:
+                'Preview a batch of entry write operations (create / update / manage). ' +
+                'Validates every operation, returns a confirmation token valid for 5 minutes, ' +
+                'and does NOT call the Toshl API. Use entry_batch_commit with the returned token to execute.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    operations: {
+                        type: 'array',
+                        description:
+                            'List of write operations. Each item is { action: "create"|"update"|"manage", data: {...} }. ' +
+                            'For "create", data matches entry-create shape (amount, currency, date, account, category, ...). ' +
+                            'For "update", data must include id plus the fields to change. ' +
+                            'For "manage", data matches the bulk-management shape (with, set, add, remove).',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                action: { type: 'string', enum: ['create', 'update', 'manage'] },
+                                data: { type: 'object' },
+                            },
+                            required: ['action', 'data'],
+                        },
+                        minItems: 1,
+                    },
+                },
+                required: ['operations'],
+            },
+        },
+        {
+            name: 'entry_batch_commit',
+            description:
+                'Execute a previously-previewed batch of entry operations. ' +
+                'Requires the confirmation_token returned by entry_batch_preview. ' +
+                'Operations run sequentially; one operation failing does not abort the rest — ' +
+                'the response reports per-operation success/failure.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    confirmation_token: {
+                        type: 'string',
+                        description: 'UUID returned by entry_batch_preview.',
+                    },
+                },
+                required: ['confirmation_token'],
+            },
+        },
+    ];
+
+    if (deleteAllowed) {
+        tools.push({
+            name: 'entry_delete',
+            description: 'Delete an entry in Toshl Finance',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Entry ID' },
+                    deleteMode: {
+                        type: 'string',
+                        description: 'Delete mode for repeating entries (all, one, tail)',
+                        enum: ['all', 'one', 'tail'],
+                    },
+                },
+                required: ['id'],
+            },
+        });
+        tools.push({
             name: 'entry_convert_to_transfer',
             description: 'Convert a regular entry to a transfer between accounts in Toshl Finance',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    id: {
-                        type: 'string',
-                        description: 'ID of the entry to convert',
-                    },
+                    id: { type: 'string', description: 'ID of the entry to convert' },
                     destination_account: {
                         type: 'string',
                         description: 'Destination account ID for the transfer',
@@ -30,847 +261,388 @@ export function setupEntryTools() {
                 },
                 required: ['id', 'destination_account'],
             },
-        },
-        {
-            name: 'entry_list',
-            description: 'List entries in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    from: {
-                        type: 'string',
-                        description: 'Start date (YYYY-MM-DD)',
-                    },
-                    to: {
-                        type: 'string',
-                        description: 'End date (YYYY-MM-DD)',
-                    },
-                    type: {
-                        type: 'string',
-                        description: 'Entry type (expense, income, transaction)',
-                    },
-                    accounts: {
-                        type: 'string',
-                        description: 'A comma separated list of account ids. If used only entries from the specified accounts are returned.',
-                    },
-                    categories: {
-                        type: 'string',
-                        description: 'A comma separated list of category ids. If used only entries in the specified categories are returned.',
-                    },
-                    tags: {
-                        type: 'string',
-                        description: 'Comma-separated list of tag IDs',
-                    },
-                    search: {
-                        type: 'string',
-                        description: 'Search term',
-                    },
-                },
-                required: ['from', 'to'],
-            },
-        },
-        {
-            name: 'entry_manage',
-            description: 'Manage entries in bulk in Toshl Finance.',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    with: {
-                        type: 'object',
-                        description: 'Criteria to select entries to manage',
-                        properties: {
-                            tags: {
-                                type: 'array',
-                                description: 'Array of tag IDs to select entries with',
-                                items: {
-                                    type: 'string',
-                                }
-                            },
-                            accounts: {
-                                type: 'array',
-                                description: 'Array of account IDs to select entries with',
-                                items: {
-                                    type: 'string',
-                                }
-                            },
-                            categories: {
-                                type: 'array',
-                                description: 'Array of category IDs to select entries with',
-                                items: {
-                                    type: 'string',
-                                }
-                            },
-                            description: {
-                                type: 'string',
-                                description: 'Description text to select entries with',
-                            }
-                        },
-                    },
-                    set: {
-                        type: 'object',
-                        description: 'Properties to set on selected entries',
-                        properties: {
-                            tags: {
-                                type: 'array',
-                                description: 'Array of tag IDs to set on entries',
-                                items: {
-                                    type: 'string',
-                                }
-                            },
-                            account: {
-                                type: 'string',
-                                description: 'Account ID to set on entries',
-                            },
-                            category: {
-                                type: 'string',
-                                description: 'Category ID to set on entries',
-                            }
-                        },
-                    },
-                    add: {
-                        type: 'object',
-                        description: 'Properties to add to selected entries',
-                        properties: {
-                            tags: {
-                                type: 'array',
-                                description: 'Array of tag IDs to add to entries',
-                                items: {
-                                    type: 'string',
-                                }
-                            }
-                        },
-                    },
-                    remove: {
-                        type: 'object',
-                        description: 'Properties to remove from selected entries',
-                        properties: {
-                            tags: {
-                                type: 'array',
-                                description: 'Array of tag IDs to remove from entries',
-                                items: {
-                                    type: 'string',
-                                }
-                            }
-                        },
-                    }
-                },
-                required: ['with'],
-            },
-        },
-        {
-            name: 'entry_get',
-            description: 'Get details of a specific entry in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    id: {
-                        type: 'string',
-                        description: 'Entry ID',
-                    },
-                },
-                required: ['id'],
-            },
-        },
-        {
-            name: 'entry_sums',
-            description: 'Get daily sums of entries in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    from: {
-                        type: 'string',
-                        description: 'Start date (YYYY-MM-DD)',
-                    },
-                    to: {
-                        type: 'string',
-                        description: 'End date (YYYY-MM-DD)',
-                    },
-                    currency: {
-                        type: 'string',
-                        description: 'Currency code',
-                    },
-                    accounts: {
-                        type: 'string',
-                        description: 'Comma-separated list of account IDs',
-                    },
-                    categories: {
-                        type: 'string',
-                        description: 'Comma-separated list of category IDs',
-                    },
-                    tags: {
-                        type: 'string',
-                        description: 'Comma-separated list of tag IDs',
-                    },
-                    range: {
-                        type: 'string',
-                        description: 'Sum range (day, week, month)',
-                    },
-                    type: {
-                        type: 'string',
-                        description: 'Entry type (expense, income)',
-                    },
-                },
-                required: ['from', 'to', 'currency'],
-            },
-        },
-        {
-            name: 'entry_timeline',
-            description: 'Get timeline of entries in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    from: {
-                        type: 'string',
-                        description: 'Start date (YYYY-MM-DD)',
-                    },
-                    to: {
-                        type: 'string',
-                        description: 'End date (YYYY-MM-DD)',
-                    },
-                    accounts: {
-                        type: 'string',
-                        description: 'Comma-separated list of account IDs',
-                    },
-                    categories: {
-                        type: 'string',
-                        description: 'Comma-separated list of category IDs',
-                    },
-                    tags: {
-                        type: 'string',
-                        description: 'Comma-separated list of tag IDs',
-                    },
-                },
-                required: ['from', 'to'],
-            },
-        },
-        {
-            name: 'entry_create',
-            description: 'Create a new entry in Toshl Finance. To create a transfer between accounts, include a transaction object with the destination account ID and currency.',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    amount: {
-                        type: 'number',
-                        description: 'Entry amount (negative for expense, positive for income)',
-                    },
-                    currency: {
-                        type: 'object',
-                        description: 'Currency object',
-                        properties: {
-                            code: {
-                                type: 'string',
-                                description: 'Currency code (e.g., USD, EUR)',
-                            },
-                            rate: {
-                                type: 'number',
-                                description: 'Exchange rate',
-                            },
-                            fixed: {
-                                type: 'boolean',
-                                description: 'Whether the exchange rate is fixed',
-                            },
-                        },
-                        required: ['code'],
-                    },
-                    date: {
-                        type: 'string',
-                        description: 'Entry date (YYYY-MM-DD)',
-                    },
-                    desc: {
-                        type: 'string',
-                        description: 'Entry description',
-                    },
-                    account: {
-                        type: 'string',
-                        description: 'Account ID',
-                    },
-                    category: {
-                        type: 'string',
-                        description: 'Category ID (use Transfer category ID for transfers)',
-                    },
-                    tags: {
-                        type: 'array',
-                        description: 'Array of tag IDs',
-                        items: {
-                            type: 'string',
-                        },
-                    },
-                    transaction: {
-                        type: 'object',
-                        description: 'Transaction object for transfers between accounts',
-                        properties: {
-                            account: {
-                                type: 'string',
-                                description: 'Destination account ID for the transfer',
-                            },
-                            currency: {
-                                type: 'object',
-                                description: 'Currency object for the destination account',
-                                properties: {
-                                    code: {
-                                        type: 'string',
-                                        description: 'Currency code (e.g., USD, EUR)',
-                                    },
-                                },
-                                required: ['code'],
-                            },
-                        },
-                        required: ['account', 'currency'],
-                    },
-                },
-                required: ['amount', 'currency', 'date', 'account', 'category'],
-            },
-        },
-        {
-            name: 'entry_update',
-            description: 'Update an existing entry in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    id: {
-                        type: 'string',
-                        description: 'Entry ID',
-                    },
-                    amount: {
-                        type: 'number',
-                        description: 'Entry amount (negative for expense, positive for income)',
-                    },
-                    currency: {
-                        type: 'object',
-                        description: 'Currency object',
-                        properties: {
-                            code: {
-                                type: 'string',
-                                description: 'Currency code (e.g., USD, EUR)',
-                            },
-                            rate: {
-                                type: 'number',
-                                description: 'Exchange rate',
-                            },
-                            fixed: {
-                                type: 'boolean',
-                                description: 'Whether the exchange rate is fixed',
-                            },
-                        },
-                        required: ['code'],
-                    },
-                    date: {
-                        type: 'string',
-                        description: 'Entry date (YYYY-MM-DD)',
-                    },
-                    desc: {
-                        type: 'string',
-                        description: 'Entry description',
-                    },
-                    account: {
-                        type: 'string',
-                        description: 'Account ID',
-                    },
-                    category: {
-                        type: 'string',
-                        description: 'Category ID',
-                    },
-                    tags: {
-                        type: 'array',
-                        description: 'Array of tag IDs',
-                        items: {
-                            type: 'string',
-                        },
-                    },
-                    updateMode: {
-                        type: 'string',
-                        description: 'Update mode for repeating entries (all, one, tail)',
-                        enum: ['all', 'one', 'tail'],
-                    },
-                },
-                required: ['id'],
-            },
-        },
-        {
-            name: 'entry_delete',
-            description: 'Delete an entry in Toshl Finance',
-            inputSchema: {
-                type: 'object',
-                properties: {
-                    id: {
-                        type: 'string',
-                        description: 'Entry ID',
-                    },
-                    deleteMode: {
-                        type: 'string',
-                        description: 'Delete mode for repeating entries (all, one, tail)',
-                        enum: ['all', 'one', 'tail'],
-                    },
-                },
-                required: ['id'],
-            },
-        },
-    ];
-}
-
-/**
- * Handles the entry_list tool
- * @param args Tool arguments
- * @returns Tool response
- */
-export async function handleEntryListTool(args: any) {
-    logger.debug('Handling entry_list tool', { args });
-
-    if (!args.from || !args.to) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameters: from and to dates',
-                },
-            ],
-            isError: true,
-        };
+        });
     }
 
+    // Reference unused schemas so tree-shakers / linters don't trim them —
+    // they are intentionally defined for documentation of the data shapes
+    // even though batch-preview's input schema is permissive (type: object).
+    void entryCreateDataSchema;
+    void entryUpdateDataSchema;
+    void entryManageDataSchema;
+
+    return tools;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Helpers                                                                   */
+/* ------------------------------------------------------------------------- */
+
+function errorResponse(message: string) {
+    return {
+        content: [{ type: 'text', text: message }],
+        isError: true,
+    };
+}
+
+function textResponse(body: unknown) {
+    return {
+        content: [{ type: 'text', text: JSON.stringify(body, null, 2) }],
+    };
+}
+
+/* ------------------------------------------------------------------------- */
+/* Read-only tool handlers                                                   */
+/* ------------------------------------------------------------------------- */
+
+export async function handleEntryListTool(args: any) {
+    logger.debug('Handling entry_list tool', { args });
+    if (!args?.from || !args?.to) {
+        return errorResponse('Missing required parameters: from and to dates');
+    }
     try {
         const entriesClient = await createEntriesClient();
         const entries = await entriesClient.listEntries(args);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(entries, null, 2),
-                },
-            ],
-        };
+        return textResponse(entries);
     } catch (error) {
         logger.error('Error handling entry_list tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error listing entries: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(`Error listing entries: ${(error as Error).message}`);
     }
 }
 
-/**
- * Handles the entry_get tool
- * @param args Tool arguments
- * @returns Tool response
- */
 export async function handleEntryGetTool(args: { id: string }) {
     logger.debug('Handling entry_get tool', { args });
-
-    if (!args.id) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameter: id',
-                },
-            ],
-            isError: true,
-        };
-    }
-
+    if (!args?.id) return errorResponse('Missing required parameter: id');
     try {
         const entriesClient = await createEntriesClient();
         const entry = await entriesClient.getEntry(args.id);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(entry, null, 2),
-                },
-            ],
-        };
+        return textResponse(entry);
     } catch (error) {
         logger.error('Error handling entry_get tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error getting entry: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(`Error getting entry: ${(error as Error).message}`);
     }
 }
 
-/**
- * Handles the entry_sums tool
- * @param args Tool arguments
- * @returns Tool response
- */
 export async function handleEntrySumsTool(args: any) {
     logger.debug('Handling entry_sums tool', { args });
-
-    if (!args.from || !args.to || !args.currency) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameters: from, to, and currency',
-                },
-            ],
-            isError: true,
-        };
+    if (!args?.from || !args?.to || !args?.currency) {
+        return errorResponse('Missing required parameters: from, to, and currency');
     }
-
     try {
         const entriesClient = await createEntriesClient();
         const sums = await entriesClient.getEntrySums(args);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(sums, null, 2),
-                },
-            ],
-        };
+        return textResponse(sums);
     } catch (error) {
         logger.error('Error handling entry_sums tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error getting entry sums: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(`Error getting entry sums: ${(error as Error).message}`);
     }
 }
 
-/**
- * Handles the entry_timeline tool
- * @param args Tool arguments
- * @returns Tool response
- */
 export async function handleEntryTimelineTool(args: any) {
     logger.debug('Handling entry_timeline tool', { args });
-
-    if (!args.from || !args.to) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameters: from and to dates',
-                },
-            ],
-            isError: true,
-        };
+    if (!args?.from || !args?.to) {
+        return errorResponse('Missing required parameters: from and to dates');
     }
-
     try {
         const entriesClient = await createEntriesClient();
         const timeline = await entriesClient.getEntryTimeline(args);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(timeline, null, 2),
-                },
-            ],
-        };
+        return textResponse(timeline);
     } catch (error) {
         logger.error('Error handling entry_timeline tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error getting entry timeline: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(`Error getting entry timeline: ${(error as Error).message}`);
     }
 }
 
-/**
- * Handles the entry_create tool
- * @param args Tool arguments
- * @returns Tool response
- */
-export async function handleEntryCreateTool(args: any) {
-    logger.debug('Handling entry_create tool', { args });
+/* ------------------------------------------------------------------------- */
+/* Per-op validation                                                         */
+/* ------------------------------------------------------------------------- */
 
-    // Check required parameters
-    if (!args.amount || !args.currency || !args.date || !args.account || !args.category) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameters: amount, currency, date, account, and category are required',
-                },
-            ],
-            isError: true,
-        };
+function validateCreateData(data: any): string | null {
+    if (!data || typeof data !== 'object') return 'data must be an object';
+    if (typeof data.amount !== 'number') return 'amount must be a number';
+    if (!data.currency || typeof data.currency !== 'object') return 'currency is required';
+    if (!data.currency.code) return 'currency.code is required';
+    if (typeof data.currency.rate !== 'undefined' && typeof data.currency.rate !== 'number') {
+        return 'currency.rate must be a number';
     }
+    if (!data.date) return 'date is required';
+    if (!data.account) return 'account is required';
+    if (!data.category) return 'category is required';
+    return null;
+}
 
-    // Check currency code
-    if (!args.currency.code) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameter: currency.code',
-                },
-            ],
-            isError: true,
-        };
+function validateUpdateData(data: any): string | null {
+    if (!data || typeof data !== 'object') return 'data must be an object';
+    if (!data.id) return 'id is required';
+    if (typeof data.amount !== 'undefined' && typeof data.amount !== 'number') {
+        return 'amount must be a number if provided';
     }
+    if (
+        typeof data.currency !== 'undefined' &&
+        typeof data.currency?.rate !== 'undefined' &&
+        typeof data.currency.rate !== 'number'
+    ) {
+        return 'currency.rate must be a number if provided';
+    }
+    return null;
+}
 
+function validateManageData(data: any): string | null {
+    if (!data || typeof data !== 'object') return 'data must be an object';
+    if (!data.with) return 'with is required';
+    if (!data.with.tags && !data.with.accounts && !data.with.categories && !data.with.description) {
+        return 'with must include at least one of: tags, accounts, categories, description';
+    }
+    if (!data.set && !data.add && !data.remove) {
+        return 'at least one of set, add, remove is required';
+    }
+    return null;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Per-op execution                                                          */
+/* ------------------------------------------------------------------------- */
+
+type OpOutcome =
+    | { success: true; result: any }
+    | { success: false; error: string };
+
+async function execCreate(data: any): Promise<OpOutcome> {
     try {
-        const entriesClient = await createEntriesClient();
-        const entry = await entriesClient.createEntry(args);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(entry, null, 2),
-                },
-            ],
-        };
-    } catch (error) {
-        logger.error('Error handling entry_create tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error creating entry: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        const client = await createEntriesClient();
+        const entry = await client.createEntry(data);
+        return { success: true, result: entry };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
     }
 }
 
-/**
- * Handles the entry_update tool
- * @param args Tool arguments
- * @returns Tool response
- */
-export async function handleEntryUpdateTool(args: any) {
-    logger.debug('Handling entry_update tool', { args });
-
-    // Check required parameters
-    if (!args.id) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameter: id',
-                },
-            ],
-            isError: true,
-        };
-    }
-
+async function execUpdate(data: any): Promise<OpOutcome> {
     try {
-        const entriesClient = await createEntriesClient();
-
-        // Extract id and updateMode from args
-        const { id, updateMode, ...entryData } = args;
-
-        // Update the entry
-        const entry = await entriesClient.updateEntry(id, entryData, updateMode);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(entry, null, 2),
-                },
-            ],
-        };
-    } catch (error) {
-        logger.error('Error handling entry_update tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error updating entry: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        const client = await createEntriesClient();
+        const { id, updateMode, ...rest } = data;
+        const entry = await client.updateEntry(id, rest, updateMode);
+        return { success: true, result: entry };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
     }
 }
 
-/**
- * Handles the entry_delete tool
- * @param args Tool arguments
- * @returns Tool response
- */
+async function execManage(data: any): Promise<OpOutcome> {
+    try {
+        const client = await createEntriesClient();
+        await client.manageEntries(data);
+        return { success: true, result: { ok: true } };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Batch preview / commit                                                    */
+/* ------------------------------------------------------------------------- */
+
+function summarize(ops: BatchOperation[]): string {
+    const counts: Record<string, number> = {};
+    for (const op of ops) counts[op.action] = (counts[op.action] || 0) + 1;
+    return Object.entries(counts)
+        .map(([a, n]) => `${n} ${a}${n === 1 ? '' : 's'}`)
+        .join(', ');
+}
+
+export async function handleEntryBatchPreview(args: any) {
+    logger.debug('Handling entry_batch_preview tool', { args });
+
+    if (!args || !Array.isArray(args.operations) || args.operations.length === 0) {
+        logAudit('preview', null, {
+            status: 'validation_failed',
+            error: 'operations must be a non-empty array',
+            attempted: args,
+        });
+        return errorResponse('operations must be a non-empty array');
+    }
+
+    const normalized: BatchOperation[] = [];
+    for (let i = 0; i < args.operations.length; i++) {
+        const op = args.operations[i];
+        if (!op || typeof op !== 'object' || !op.action || !op.data) {
+            const err = `operation ${i}: must be an object with "action" and "data"`;
+            logAudit('preview', null, { status: 'validation_failed', error: err, attempted: args.operations });
+            return errorResponse(err);
+        }
+        let validationError: string | null;
+        switch (op.action) {
+            case 'create':
+                validationError = validateCreateData(op.data);
+                break;
+            case 'update':
+                validationError = validateUpdateData(op.data);
+                break;
+            case 'manage':
+                validationError = validateManageData(op.data);
+                break;
+            default:
+                validationError = `unknown action "${op.action}" (must be create, update, or manage)`;
+        }
+        if (validationError) {
+            const err = `operation ${i} (${op.action}): ${validationError}`;
+            logAudit('preview', null, {
+                status: 'validation_failed',
+                error: err,
+                attempted: args.operations,
+            });
+            return errorResponse(err);
+        }
+        normalized.push({ action: op.action, data: op.data });
+    }
+
+    const { token, expiresAt } = createBatch(normalized);
+    const expiresIso = new Date(expiresAt).toISOString();
+
+    logAudit('preview', token, { operations: normalized, expires_at: expiresIso });
+
+    return textResponse({
+        confirmation_token: token,
+        expires_at: expiresIso,
+        summary: summarize(normalized),
+        operations: normalized,
+    });
+}
+
+export async function handleEntryBatchCommit(args: any) {
+    logger.debug('Handling entry_batch_commit tool', { args });
+
+    const token = args?.confirmation_token;
+    if (!token || typeof token !== 'string') {
+        logAudit('commit', null, { status: 'missing_token', attempted: args });
+        return errorResponse('Missing required parameter: confirmation_token');
+    }
+
+    const claimed = claimBatch(token);
+    if (claimed.status !== 'ok') {
+        logAudit('commit', token, { status: claimed.status });
+        const msg =
+            claimed.status === 'missing'
+                ? 'Confirmation token not found. Call entry_batch_preview first.'
+                : claimed.status === 'expired'
+                  ? 'Confirmation token expired (tokens are valid for 5 minutes). Call entry_batch_preview again.'
+                  : 'Confirmation token already used. Call entry_batch_preview again.';
+        return errorResponse(msg);
+    }
+
+    const results: Array<{ index: number; action: string } & OpOutcome> = [];
+    for (let i = 0; i < claimed.operations.length; i++) {
+        const op = claimed.operations[i];
+        let outcome: OpOutcome;
+        switch (op.action) {
+            case 'create':
+                outcome = await execCreate(op.data);
+                break;
+            case 'update':
+                outcome = await execUpdate(op.data);
+                break;
+            case 'manage':
+                outcome = await execManage(op.data);
+                break;
+            default:
+                outcome = { success: false, error: `unknown action: ${(op as any).action}` };
+        }
+        results.push({ index: i, action: op.action, ...outcome });
+    }
+
+    const successes = results.filter((r) => r.success).length;
+    const failures = results.length - successes;
+
+    logAudit('commit', token, {
+        total: results.length,
+        successes,
+        failures,
+        results,
+    });
+
+    return textResponse({
+        total: results.length,
+        successes,
+        failures,
+        results,
+    });
+}
+
+/* ------------------------------------------------------------------------- */
+/* Delete / convert — gated by TOSHL_ALLOW_DELETE                            */
+/* ------------------------------------------------------------------------- */
+
 export async function handleEntryDeleteTool(args: any) {
     logger.debug('Handling entry_delete tool', { args });
 
-    // Check required parameters
-    if (!args.id) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameter: id',
-                },
-            ],
-            isError: true,
-        };
+    if (!isDeleteAllowed()) {
+        logAudit('delete_blocked', null, { attempted: args });
+        return errorResponse(
+            'Entry deletion is disabled. Set TOSHL_ALLOW_DELETE=true to enable.',
+        );
     }
+
+    if (!args?.id) return errorResponse('Missing required parameter: id');
 
     try {
         const entriesClient = await createEntriesClient();
-
-        // Delete the entry
         await entriesClient.deleteEntry(args.id, args.deleteMode);
-
         return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Entry ${args.id} deleted successfully`,
-                },
-            ],
+            content: [{ type: 'text', text: `Entry ${args.id} deleted successfully` }],
         };
     } catch (error) {
         logger.error('Error handling entry_delete tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error deleting entry: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(`Error deleting entry: ${(error as Error).message}`);
     }
 }
 
-/**
- * Handles the entry_manage tool
- * @param args Tool arguments
- * @returns Tool response
- */
-export async function handleEntryManageTool(args: any) {
-    logger.debug('Handling entry_manage tool', { args });
-
-    // Check required parameters
-    if (!args.with) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameter: with',
-                },
-            ],
-            isError: true,
-        };
-    }
-
-    // Check that at least one with parameter is provided
-    if (!args.with.tags && !args.with.accounts && !args.with.categories && !args.with.description) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'At least one with parameter is required (tags, accounts, categories, or description)',
-                },
-            ],
-            isError: true,
-        };
-    }
-
-    // Check that at least one action parameter is provided
-    if (!args.set && !args.add && !args.remove) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'At least one action parameter is required (set, add, or remove)',
-                },
-            ],
-            isError: true,
-        };
-    }
-
-    try {
-        const entriesClient = await createEntriesClient();
-
-        // Manage the entries
-        await entriesClient.manageEntries(args);
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Entries managed successfully',
-                },
-            ],
-        };
-    } catch (error) {
-        logger.error('Error handling entry_manage tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error managing entries: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
-    }
-}
-
-/**
- * Handles the entry_convert_to_transfer tool
- * @param args Tool arguments
- * @returns Tool response
- */
-export async function handleEntryConvertToTransferTool(args: { id: string; destination_account: string; description?: string }) {
+export async function handleEntryConvertToTransferTool(args: {
+    id: string;
+    destination_account: string;
+    description?: string;
+}) {
     logger.debug('Handling entry_convert_to_transfer tool', { args });
 
-    // Check required parameters
-    if (!args.id || !args.destination_account) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: 'Missing required parameters: id and destination_account are required',
-                },
-            ],
-            isError: true,
-        };
+    if (!isDeleteAllowed()) {
+        logAudit('convert_blocked', null, { attempted: args });
+        return errorResponse(
+            'entry_convert_to_transfer requires deletion of the original entry, which is disabled. ' +
+                'Set TOSHL_ALLOW_DELETE=true to enable.',
+        );
+    }
+
+    if (!args?.id || !args?.destination_account) {
+        return errorResponse(
+            'Missing required parameters: id and destination_account are required',
+        );
+    }
+
+    let transferCategoryId: string | null;
+    try {
+        transferCategoryId = await getTransferCategoryId();
+    } catch (e) {
+        logger.error('Failed to look up transfer category', { error: e });
+        return errorResponse(
+            `Failed to look up transfer category: ${(e as Error).message}`,
+        );
+    }
+    if (!transferCategoryId) {
+        return errorResponse(
+            'No transfer-type category found in the Toshl account. Cannot convert to transfer.',
+        );
     }
 
     try {
         const entriesClient = await createEntriesClient();
-
-        // Get the original entry
         const originalEntry = await entriesClient.getEntry(args.id);
 
-        // Create a new transfer entry
         const transferEntry = {
             amount: originalEntry.amount,
             currency: originalEntry.currency,
             date: originalEntry.date,
             desc: args.description || `Transfer to ${args.destination_account}`,
             account: originalEntry.account,
-            category: '73101634', // Transfer category ID
+            category: transferCategoryId,
             tags: originalEntry.tags,
             transaction: {
                 account: args.destination_account,
@@ -878,45 +650,24 @@ export async function handleEntryConvertToTransferTool(args: { id: string; desti
             } as any,
         };
 
-        // Create the transfer entry
         const newEntry = await entriesClient.createEntry(transferEntry);
-
-        // Delete the original entry
         await entriesClient.deleteEntry(args.id);
 
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify(newEntry, null, 2),
-                },
-            ],
-        };
+        return textResponse(newEntry);
     } catch (error) {
         logger.error('Error handling entry_convert_to_transfer tool', { args, error });
-
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error converting entry to transfer: ${(error as Error).message}`,
-                },
-            ],
-            isError: true,
-        };
+        return errorResponse(
+            `Error converting entry to transfer: ${(error as Error).message}`,
+        );
     }
 }
 
-/**
- * Handles entry tools
- * @param toolName Tool name
- * @param args Tool arguments
- * @returns Tool response
- */
+/* ------------------------------------------------------------------------- */
+/* Dispatcher                                                                */
+/* ------------------------------------------------------------------------- */
+
 export async function handleEntryTool(toolName: string, args: any) {
     switch (toolName) {
-        case 'entry_convert_to_transfer':
-            return handleEntryConvertToTransferTool(args as { id: string; destination_account: string; description?: string });
         case 'entry_list':
             return handleEntryListTool(args);
         case 'entry_get':
@@ -925,18 +676,19 @@ export async function handleEntryTool(toolName: string, args: any) {
             return handleEntrySumsTool(args);
         case 'entry_timeline':
             return handleEntryTimelineTool(args);
-        case 'entry_create':
-            return handleEntryCreateTool(args);
-        case 'entry_update':
-            return handleEntryUpdateTool(args);
+        case 'entry_batch_preview':
+            return handleEntryBatchPreview(args);
+        case 'entry_batch_commit':
+            return handleEntryBatchCommit(args);
         case 'entry_delete':
+            // Handler is kept for the case where the flag is off but a caller
+            // still attempts the unlisted tool — we log and refuse.
             return handleEntryDeleteTool(args);
-        case 'entry_manage':
-            return handleEntryManageTool(args);
-        default:
-            throw new McpError(
-                ErrorCode.MethodNotFound,
-                `Tool not found: ${toolName}`
+        case 'entry_convert_to_transfer':
+            return handleEntryConvertToTransferTool(
+                args as { id: string; destination_account: string; description?: string },
             );
+        default:
+            throw new McpError(ErrorCode.MethodNotFound, `Tool not found: ${toolName}`);
     }
 }

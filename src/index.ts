@@ -2,6 +2,7 @@
 import dotenv from 'dotenv';
 import { ToshlMcpServer } from './server/server.js';
 import { setupLogger } from './utils/logger.js';
+import { initAuditLog } from './utils/audit-log.js';
 
 // Load environment variables
 dotenv.config();
@@ -13,6 +14,9 @@ const logger = setupLogger();
 async function main() {
     try {
         logger.info('Starting Toshl MCP Server...');
+
+        // Ensure the audit-log directory exists before any tool can fire.
+        initAuditLog();
 
         const server = new ToshlMcpServer();
         await server.start();

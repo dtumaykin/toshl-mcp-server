@@ -13,9 +13,7 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": [
-    "src/**/*",
-    "lib/toshl-api/toshl-client.ts",
-    "lib/toshl-api/pagination-helpers.ts"
+    "src/**/*"
   ],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
