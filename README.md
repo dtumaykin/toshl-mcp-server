@@ -204,12 +204,58 @@ This fork adds two safety mechanisms for anyone running the server against a rea
 
 ### Batch preview / commit flow
 
-Write operations (`create`, `update`, `manage`) are not exposed as individual tools. Instead, they go through a two-step flow:
+Write operations (`create`, `update`, `manage`, `split`) are not exposed as individual tools. Instead, they go through a two-step flow:
 
 1. `entry_batch_preview` — accepts an `operations` array of `{ action, data }` items, validates every operation, generates a UUID confirmation token (5-minute expiry), appends a `preview` record to the audit log, and returns the token plus the normalised operations and a count summary (e.g. `"3 creates, 1 update"`). No Toshl API call is made.
 2. `entry_batch_commit` — accepts the `confirmation_token` returned by preview, marks the token used (preventing replay), executes each operation in order, and returns a per-operation result list. A single failed operation does not abort the rest; the response is honest about partial success.
 
 Single-entry edits are expressed as a batch of one — the flow is the same for interactive use and scheduled use.
+
+#### Split action
+
+The `split` action turns one expense entry into "what stayed on me" plus "what a friend owes me". Use it when you paid for a shared expense and want the friend's share recorded as money owed.
+
+What it does, given an original expense (e.g. `-100 EUR` from your checking account):
+
+1. **Creates a new transfer entry** from the same source account to a `friend_account` you supply, for the friend's share (e.g. `-50 EUR`). The transfer uses the Toshl "transfer"-type category and inherits the original entry's currency, date, and tags. Its description defaults to the original's `desc` but can be overridden with `transfer_desc`.
+2. **Reduces the original entry's amount** to the user's retained portion (e.g. `-50 EUR`). The original's description, account, category, date, and tags are unchanged.
+
+Inputs (the `data` block of a `split` operation):
+
+- `id` (required) — the original expense entry's ID.
+- `friend_account` (required) — destination account ID for the transfer (i.e. the friend's tracking account).
+- Exactly one of:
+  - `share_amount` — the friend's portion as a positive absolute number, in the original entry's currency.
+  - `equal: true` — 50/50 split.
+- `transfer_desc` (optional) — description for the transfer entry. Defaults to the original entry's `desc`.
+
+Constraints, enforced at commit time:
+
+- The original must be an expense (negative `amount`) and must not already be a transfer.
+- The share must be `> 0` and strictly less than the original's absolute amount (so a non-zero portion stays as your expense). Amounts are rounded to 2 decimals.
+
+Worked example — 100 EUR dinner, 50/50:
+
+```jsonc
+// entry_batch_preview
+{
+  "operations": [
+    { "action": "split",
+      "data": {
+        "id": "<dinner-entry-id>",
+        "friend_account": "<friend-tracking-account-id>",
+        "equal": true
+      } }
+  ]
+}
+// → returns { confirmation_token, summary: "1 split", ... }
+
+// entry_batch_commit
+{ "confirmation_token": "<token>" }
+// → result includes { original_id, retained_amount: -50, transfer_id, transfer_amount: -50 }
+```
+
+Ordering and recovery: the transfer entry is created first; only then is the original reduced. If the create succeeds but the subsequent update fails, the response returns both the new `transfer_id` and the target `retained_amount` so you can manually reconcile. The split's pre-state and the new transfer's ID are written to the audit log between the two API calls, so the recovery handle is durable on disk.
 
 ### Audit log
 

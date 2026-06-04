@@ -3,7 +3,8 @@ import { randomUUID } from 'crypto';
 export type BatchOperation =
     | { action: 'create'; data: Record<string, any> }
     | { action: 'update'; data: Record<string, any> }
-    | { action: 'manage'; data: Record<string, any> };
+    | { action: 'manage'; data: Record<string, any> }
+    | { action: 'split'; data: Record<string, any> };
 
 interface BatchRecord {
     operations: BatchOperation[];

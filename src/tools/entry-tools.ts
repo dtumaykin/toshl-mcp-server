@@ -105,6 +105,38 @@ const entryManageDataSchema = {
     required: ['with'],
 };
 
+const entrySplitDataSchema = {
+    type: 'object',
+    properties: {
+        id: {
+            type: 'string',
+            description: 'ID of the original expense entry to split',
+        },
+        friend_account: {
+            type: 'string',
+            description:
+                "Friend's tracking account ID. The friend's share will be created as a transfer entry from the original entry's account to this account.",
+        },
+        share_amount: {
+            type: 'number',
+            description:
+                "Friend's portion as an absolute positive number, in the original entry's currency. Mutually exclusive with `equal`.",
+        },
+        equal: {
+            type: 'boolean',
+            description:
+                'If true, split 50/50 between the user and the friend. Mutually exclusive with `share_amount`.',
+        },
+        transfer_desc: {
+            type: 'string',
+            description:
+                "Optional description for the generated transfer entry. Defaults to the original entry's desc.",
+        },
+    },
+    required: ['id', 'friend_account'],
+    oneOf: [{ required: ['share_amount'] }, { required: ['equal'] }],
+};
+
 /**
  * Sets up entry tools. The set of tools depends on runtime config:
  *   - entry_delete is only listed when TOSHL_ALLOW_DELETE=true.
@@ -179,7 +211,7 @@ export function setupEntryTools() {
         {
             name: 'entry_batch_preview',
             description:
-                'Preview a batch of entry write operations (create / update / manage). ' +
+                'Preview a batch of entry write operations (create / update / manage / split). ' +
                 'Validates every operation, returns a confirmation token valid for 5 minutes, ' +
                 'and does NOT call the Toshl API. Use entry_batch_commit with the returned token to execute.',
             inputSchema: {
@@ -188,14 +220,15 @@ export function setupEntryTools() {
                     operations: {
                         type: 'array',
                         description:
-                            'List of write operations. Each item is { action: "create"|"update"|"manage", data: {...} }. ' +
+                            'List of write operations. Each item is { action: "create"|"update"|"manage"|"split", data: {...} }. ' +
                             'For "create", data matches entry-create shape (amount, currency, date, account, category, ...). ' +
                             'For "update", data must include id plus the fields to change. ' +
-                            'For "manage", data matches the bulk-management shape (with, set, add, remove).',
+                            'For "manage", data matches the bulk-management shape (with, set, add, remove). ' +
+                            'For "split", data is { id, friend_account, share_amount|equal, transfer_desc? } — reduces the original expense to the user\'s portion and creates a transfer for the friend\'s share.',
                         items: {
                             type: 'object',
                             properties: {
-                                action: { type: 'string', enum: ['create', 'update', 'manage'] },
+                                action: { type: 'string', enum: ['create', 'update', 'manage', 'split'] },
                                 data: { type: 'object' },
                             },
                             required: ['action', 'data'],
@@ -270,6 +303,7 @@ export function setupEntryTools() {
     void entryCreateDataSchema;
     void entryUpdateDataSchema;
     void entryManageDataSchema;
+    void entrySplitDataSchema;
 
     return tools;
 }
@@ -399,6 +433,34 @@ function validateManageData(data: any): string | null {
     return null;
 }
 
+function validateSplitData(data: any): string | null {
+    if (!data || typeof data !== 'object') return 'data must be an object';
+    if (typeof data.id !== 'string' || data.id.length === 0) return 'id is required';
+    if (typeof data.friend_account !== 'string' || data.friend_account.length === 0) {
+        return 'friend_account is required';
+    }
+    const hasShare = data.share_amount !== undefined;
+    const hasEqual = data.equal !== undefined;
+    if (hasShare === hasEqual) {
+        return 'exactly one of share_amount or equal must be set';
+    }
+    if (hasShare) {
+        if (typeof data.share_amount !== 'number' || !Number.isFinite(data.share_amount)) {
+            return 'share_amount must be a finite number';
+        }
+        if (data.share_amount <= 0) {
+            return 'share_amount must be a positive number (sign is taken from the original entry)';
+        }
+    }
+    if (hasEqual && data.equal !== true) {
+        return 'equal must be the boolean literal true (omit the field for non-equal splits)';
+    }
+    if (data.transfer_desc !== undefined && typeof data.transfer_desc !== 'string') {
+        return 'transfer_desc must be a string if provided';
+    }
+    return null;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Per-op execution                                                          */
 /* ------------------------------------------------------------------------- */
@@ -436,6 +498,134 @@ async function execManage(data: any): Promise<OpOutcome> {
     } catch (e) {
         return { success: false, error: (e as Error).message };
     }
+}
+
+/**
+ * Split an existing expense entry.
+ *
+ * Ordering matches `entry_convert_to_transfer`: create the new transfer first,
+ * then mutate the original. A failed create leaves the original entry untouched
+ * (safe to retry). The audit record is written *between* create and update so
+ * the transfer id is durable on disk before we touch the original — that gives
+ * the user a recovery handle if the subsequent update fails.
+ */
+async function execSplit(data: any, token: string): Promise<OpOutcome> {
+    const client = await createEntriesClient();
+
+    // 1. Fetch original.
+    let original: any;
+    try {
+        original = await client.getEntry(data.id);
+    } catch (e) {
+        return { success: false, error: `entry ${data.id} not found: ${(e as Error).message}` };
+    }
+
+    // 2. Runtime invariants.
+    if (original.transaction !== undefined && original.transaction !== null) {
+        return {
+            success: false,
+            error: `entry ${data.id} is already a transfer; splits operate on regular expense entries`,
+        };
+    }
+    if (typeof original.amount !== 'number') {
+        return { success: false, error: `entry ${data.id} has no numeric amount` };
+    }
+    if (original.amount >= 0) {
+        return {
+            success: false,
+            error: `entry ${data.id} is not an expense (amount is ${original.amount}); split is only defined for expenses (negative amounts)`,
+        };
+    }
+
+    const round2 = (x: number) => Math.round(x * 100) / 100;
+    const absOriginal = Math.abs(original.amount);
+    const absShare = data.equal ? round2(absOriginal / 2) : round2(data.share_amount);
+
+    if (!(absShare > 0 && absShare < absOriginal)) {
+        return {
+            success: false,
+            error: `share (${absShare}) must be greater than 0 and strictly less than the original amount (${absOriginal})`,
+        };
+    }
+
+    const shareSigned = -absShare;
+    const retainedSigned = round2(original.amount - shareSigned);
+
+    // 3. Resolve transfer category.
+    let transferCategoryId: string | null;
+    try {
+        transferCategoryId = await getTransferCategoryId();
+    } catch (e) {
+        return {
+            success: false,
+            error: `failed to look up transfer category: ${(e as Error).message}`,
+        };
+    }
+    if (!transferCategoryId) {
+        return {
+            success: false,
+            error: 'no transfer-type category found in the Toshl account; cannot create transfer',
+        };
+    }
+
+    // 4. Build and create the transfer entry.
+    const transferPayload: any = {
+        amount: shareSigned,
+        currency: original.currency,
+        date: original.date,
+        desc: data.transfer_desc ?? original.desc,
+        account: original.account,
+        category: transferCategoryId,
+        tags: original.tags,
+        transaction: {
+            account: data.friend_account,
+            currency: original.currency,
+        },
+    };
+
+    let transfer: any;
+    try {
+        transfer = await client.createEntry(transferPayload);
+    } catch (e) {
+        return {
+            success: false,
+            error: `failed to create transfer entry: ${(e as Error).message}`,
+        };
+    }
+
+    // 5. Audit the split *before* mutating the original, so the transfer id is
+    //    durable on disk even if the subsequent update fails.
+    logAudit('commit', token, {
+        sub: 'split',
+        original_id: data.id,
+        original_amount_pre: original.amount,
+        retained_amount: retainedSigned,
+        transfer_id: transfer.id,
+        transfer_amount: shareSigned,
+        friend_account: data.friend_account,
+    });
+
+    // 6. Reduce the original entry's amount.
+    try {
+        await client.updateEntry(data.id, { amount: retainedSigned });
+    } catch (e) {
+        return {
+            success: false,
+            error:
+                `transfer ${transfer.id} was created (amount ${shareSigned}) but the original entry ${data.id} could not be updated: ${(e as Error).message}. ` +
+                `Recover by manually setting entry ${data.id} amount to ${retainedSigned}, or by deleting transfer ${transfer.id}.`,
+        };
+    }
+
+    return {
+        success: true,
+        result: {
+            original_id: data.id,
+            retained_amount: retainedSigned,
+            transfer_id: transfer.id,
+            transfer_amount: shareSigned,
+        },
+    };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -481,8 +671,11 @@ export async function handleEntryBatchPreview(args: any) {
             case 'manage':
                 validationError = validateManageData(op.data);
                 break;
+            case 'split':
+                validationError = validateSplitData(op.data);
+                break;
             default:
-                validationError = `unknown action "${op.action}" (must be create, update, or manage)`;
+                validationError = `unknown action "${op.action}" (must be create, update, manage, or split)`;
         }
         if (validationError) {
             const err = `operation ${i} (${op.action}): ${validationError}`;
@@ -543,6 +736,9 @@ export async function handleEntryBatchCommit(args: any) {
                 break;
             case 'manage':
                 outcome = await execManage(op.data);
+                break;
+            case 'split':
+                outcome = await execSplit(op.data, token);
                 break;
             default:
                 outcome = { success: false, error: `unknown action: ${(op as any).action}` };
