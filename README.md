@@ -201,6 +201,7 @@ This fork adds two safety mechanisms for anyone running the server against a rea
   - When `false`, `entry_convert_to_transfer` is also not listed, because the conversion deletes the original entry.
   - If a caller invokes either tool anyway, the call is refused with an error and a `delete_blocked` / `convert_blocked` record is appended to the audit log.
 - `TOSHL_AUDIT_LOG` (default: `~/.toshl-mcp/audit.log`, with `~` expanded to the home directory). File path for the audit log. The parent directory is created at startup if it does not exist.
+- `TOSHL_TRANSFER_CATEGORY_ID` (optional). Override for the auto-detected Transfer category. By default the server picks the category where `type === 'expense'` and `name` matches `Transfer` (case-insensitive) — that's the source-side leg of a Toshl transfer. Set this if your account uses a localized category name (e.g. "Virement", "Überweisung") or if auto-detection picks the wrong category. Find the ID via `category_list` and restart the server after setting.
 
 ### Batch preview / commit flow
 

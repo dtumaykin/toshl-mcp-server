@@ -564,7 +564,11 @@ async function execSplit(data: any, token: string): Promise<OpOutcome> {
     if (!transferCategoryId) {
         return {
             success: false,
-            error: 'no transfer-type category found in the Toshl account; cannot create transfer',
+            error:
+                'No Transfer category resolved. Toshl categories have type expense|income|system; ' +
+                'the source-side Transfer category typically has type=expense and name="Transfer". ' +
+                'Use category_list to find your Transfer (expense) category, then set ' +
+                'TOSHL_TRANSFER_CATEGORY_ID=<that id> and restart the MCP server.',
         };
     }
 
@@ -824,7 +828,10 @@ export async function handleEntryConvertToTransferTool(args: {
     }
     if (!transferCategoryId) {
         return errorResponse(
-            'No transfer-type category found in the Toshl account. Cannot convert to transfer.',
+            'No Transfer category resolved. Toshl categories have type expense|income|system; ' +
+                'the source-side Transfer category typically has type=expense and name="Transfer". ' +
+                'Use category_list to find your Transfer (expense) category, then set ' +
+                'TOSHL_TRANSFER_CATEGORY_ID=<that id> and restart the MCP server.',
         );
     }
 
