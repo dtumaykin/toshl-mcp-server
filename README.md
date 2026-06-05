@@ -218,7 +218,7 @@ The `split` action turns one expense entry into "what stayed on me" plus "what a
 
 What it does, given an original expense (e.g. `-100 EUR` from your checking account):
 
-1. **Creates a new transfer entry** from the same source account to a `friend_account` you supply, for the friend's share (e.g. `-50 EUR`). The transfer uses the Toshl "transfer"-type category and inherits the original entry's currency, date, and tags. Its description defaults to the original's `desc` but can be overridden with `transfer_desc`.
+1. **Creates a new transfer entry** from the same source account to a `friend_account` you supply, for the friend's share (e.g. `-50 EUR`). The transfer uses the Toshl system Transfer category and inherits the original entry's currency and date. Its description defaults to the original's `desc` but can be overridden with `transfer_desc`. **Tags are not propagated** to the transfer entry — Toshl scopes user tags to user (expense/income) categories and rejects them with 400 when attached to the system Transfer category. The original entry keeps its tags untouched.
 2. **Reduces the original entry's amount** to the user's retained portion (e.g. `-50 EUR`). The original's description, account, category, date, and tags are unchanged.
 
 Inputs (the `data` block of a `split` operation):

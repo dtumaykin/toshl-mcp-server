@@ -573,6 +573,12 @@ async function execSplit(data: any, token: string): Promise<OpOutcome> {
     }
 
     // 4. Build and create the transfer entry.
+    //
+    // Tags are intentionally NOT propagated from the original. User tags in
+    // Toshl are scoped to user (expense/income) categories; attaching them to
+    // an entry whose category is the system Transfer category causes the API
+    // to reject the create with 400. The retained portion of the original
+    // keeps its tags untouched (updateEntry only sends { amount }).
     const transferPayload: any = {
         amount: shareSigned,
         currency: original.currency,
@@ -580,7 +586,6 @@ async function execSplit(data: any, token: string): Promise<OpOutcome> {
         desc: data.transfer_desc ?? original.desc,
         account: original.account,
         category: transferCategoryId,
-        tags: original.tags,
         transaction: {
             account: data.friend_account,
             currency: original.currency,
@@ -839,6 +844,9 @@ export async function handleEntryConvertToTransferTool(args: {
         const entriesClient = await createEntriesClient();
         const originalEntry = await entriesClient.getEntry(args.id);
 
+        // Tags from the original are intentionally dropped — user tags are
+        // scoped to user (expense/income) categories and Toshl rejects them
+        // with 400 when attached to a transfer (system Transfer category).
         const transferEntry = {
             amount: originalEntry.amount,
             currency: originalEntry.currency,
@@ -846,7 +854,6 @@ export async function handleEntryConvertToTransferTool(args: {
             desc: args.description || `Transfer to ${args.destination_account}`,
             account: originalEntry.account,
             category: transferCategoryId,
-            tags: originalEntry.tags,
             transaction: {
                 account: args.destination_account,
                 currency: originalEntry.currency,
