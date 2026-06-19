@@ -18,8 +18,7 @@ export class EntriesClient {
      */
     async listEntries(params?: Record<string, any>): Promise<ToshlEntry[]> {
         logger.debug('Fetching entries list', { params });
-        const response = await this.client.get<ToshlEntry[]>('/entries', params);
-        return response.data;
+        return this.client.getAll<ToshlEntry>('/entries', params);
     }
 
     /**

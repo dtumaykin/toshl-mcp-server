@@ -202,6 +202,58 @@ export class ToshlApiClient {
     }
 
     /**
+     * GETs every page of a list endpoint, following Link: rel="next" headers,
+     * and returns the concatenated items. Use for endpoints whose response is
+     * a JSON array that may exceed Toshl's per-page cap (200 by default).
+     *
+     * The first page is fetched via the standard `get()` (cache + error handling
+     * applies). Subsequent pages use the absolute URL from the next-link header
+     * and call axios directly — axios ignores `baseURL` for absolute URLs.
+     *
+     * Capped at MAX_PAGES as a runaway-loop safety net; logs a warning if hit.
+     */
+    async getAll<T>(path: string, params?: Record<string, any>): Promise<T[]> {
+        const MAX_PAGES = 200;
+        const all: T[] = [];
+
+        const first = await this.get<T[]>(path, params);
+        all.push(...first.data);
+        let nextUrl = this.parseNextLink(first.headers['link']);
+
+        let page = 1;
+        while (nextUrl && page < MAX_PAGES) {
+            try {
+                const resp: AxiosResponse = await this.client.get(nextUrl);
+                all.push(...(resp.data as T[]));
+                nextUrl = this.parseNextLink(resp.headers['link']);
+            } catch (error) {
+                handleApiError(error);
+                throw error;
+            }
+            page++;
+        }
+
+        if (page >= MAX_PAGES && nextUrl) {
+            logger.warn('getAll reached safety cap; results may be incomplete', {
+                path,
+                pages: MAX_PAGES,
+                total: all.length,
+            });
+        }
+        if (page > 1) {
+            logger.debug('getAll paginated', { path, pages: page, total: all.length });
+        }
+
+        return all;
+    }
+
+    private parseNextLink(linkHeader: string | undefined): string | null {
+        if (!linkHeader) return null;
+        const m = String(linkHeader).match(/<([^>]+)>\s*;\s*rel="next"/);
+        return m ? m[1] : null;
+    }
+
+    /**
      * Checks if the client is properly authenticated
      * @returns true if authenticated
      */

@@ -23,9 +23,7 @@ export class TagsClient {
      */
     async listTags(): Promise<ToshlTag[]> {
         logger.debug('Fetching tags list');
-
-        const response = await this.client.get<ToshlTag[]>('/tags');
-        return response.data;
+        return this.client.getAll<ToshlTag>('/tags');
     }
 
     /**

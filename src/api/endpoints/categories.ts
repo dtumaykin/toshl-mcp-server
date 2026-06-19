@@ -23,9 +23,7 @@ export class CategoriesClient {
      */
     async listCategories(): Promise<ToshlCategory[]> {
         logger.debug('Fetching categories list');
-
-        const response = await this.client.get<ToshlCategory[]>('/categories');
-        return response.data;
+        return this.client.getAll<ToshlCategory>('/categories');
     }
 
     /**

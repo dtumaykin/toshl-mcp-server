@@ -23,9 +23,7 @@ export class AccountsClient {
      */
     async listAccounts(): Promise<ToshlAccount[]> {
         logger.debug('Fetching accounts list');
-
-        const response = await this.client.get<ToshlAccount[]>('/accounts');
-        return response.data;
+        return this.client.getAll<ToshlAccount>('/accounts');
     }
 
     /**

@@ -31,8 +31,7 @@ export class BudgetsClient {
             params.from = from;
         }
 
-        const response = await this.client.get<ToshlBudget[]>('/budgets', params);
-        return response.data;
+        return this.client.getAll<ToshlBudget>('/budgets', params);
     }
 
     /**
