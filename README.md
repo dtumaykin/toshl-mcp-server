@@ -202,13 +202,14 @@ This fork adds two safety mechanisms for anyone running the server against a rea
   - If a caller invokes either tool anyway, the call is refused with an error and a `delete_blocked` / `convert_blocked` record is appended to the audit log.
 - `TOSHL_AUDIT_LOG` (default: `~/.toshl-mcp/audit.log`, with `~` expanded to the home directory). File path for the audit log. The parent directory is created at startup if it does not exist.
 - `TOSHL_TRANSFER_CATEGORY_ID` (optional). Override for the auto-detected Transfer category. By default the server picks the category where `type === 'expense'` and `name` matches `Transfer` (case-insensitive) — that's the source-side leg of a Toshl transfer. Set this if your account uses a localized category name (e.g. "Virement", "Überweisung") or if auto-detection picks the wrong category. Find the ID via `category_list` and restart the server after setting.
+- `TOSHL_RECONCILIATION_CATEGORY_ID` (optional). Override for the auto-detected system Reconciliation category. By default the server picks the category where `type === 'system'` and `name` starts with `Reconc` (case-insensitive) and uses it to reject preview-time attempts to write that category on entry create/update. Set this if auto-detection fails; without it, such writes still fail — just at commit time with the raw Toshl 400/403.
 
 ### Batch preview / commit flow
 
 Write operations (`create`, `update`, `manage`, `split`) are not exposed as individual tools. Instead, they go through a two-step flow:
 
-1. `entry_batch_preview` — accepts an `operations` array of `{ action, data }` items, validates every operation, generates a UUID confirmation token (5-minute expiry), appends a `preview` record to the audit log, and returns the token plus the normalised operations and a count summary (e.g. `"3 creates, 1 update"`). No Toshl API call is made.
-2. `entry_batch_commit` — accepts the `confirmation_token` returned by preview, marks the token used (preventing replay), executes each operation in order, and returns a per-operation result list. A single failed operation does not abort the rest; the response is honest about partial success.
+1. `entry_batch_preview` — accepts an `operations` array of `{ action, data }` items, validates every operation, generates a UUID confirmation token (5-minute expiry), appends a `preview` record to the audit log, and returns the token plus the normalised operations and a count summary (e.g. `"3 creates, 1 update"`). No Toshl API call is made. Preview also rejects any `create` / `update` op whose `category` refers to the system Reconciliation category — that write path is not allowed by Toshl's public API (see the "Limitations" section below).
+2. `entry_batch_commit` — accepts the `confirmation_token` returned by preview, marks the token used (preventing replay), and executes each operation in order **atomically: stops on the first failure**. Successful earlier ops are NOT auto-rolled back — the response reports which ops committed, which one failed, and which never ran (`status: "skipped"`) so you can reverse manually if needed. The result shape is `{ total, committed, aborted, failed_index, skipped, results }`.
 
 Single-entry edits are expressed as a batch of one — the flow is the same for interactive use and scheduled use.
 
@@ -257,6 +258,16 @@ Worked example — 100 EUR dinner, 50/50:
 ```
 
 Ordering and recovery: the transfer entry is created first; only then is the original reduced. If the create succeeds but the subsequent update fails, the response returns both the new `transfer_id` and the target `retained_amount` so you can manually reconcile. The split's pre-state and the new transfer's ID are written to the audit log between the two API calls, so the recovery handle is durable on disk.
+
+### Limitations
+
+**Reconciliation entries are not writable via the public Toshl API.** The Toshl app's "adjust balance" feature uses a private endpoint that isn't documented at [developer.toshl.com](https://developer.toshl.com/docs/accounts/). Concretely:
+
+- `POST /entries` with `category: "reconciliation"` returns 400.
+- `PUT /accounts/{id}` with a changed `balance` is silently discarded on `type: custom, recalculated: true` accounts — no reconciliation entry is generated, the previous balance stands.
+- There is no `POST /accounts/{id}/reconcile` or equivalent public endpoint.
+
+Because of this, the server does NOT expose a `reconcile` action, and it rejects at preview time any `create` / `update` op whose `category` refers to the reconciliation category. The accepted workaround for balancing a custom account to a target market value is a normal entry in one of your own categories (e.g. an "Unrealized P&L" income/expense category) sized so Toshl's recalculated balance lands on the target. True cost-basis reconciliation remains app-only.
 
 ### Audit log
 

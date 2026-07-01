@@ -5,6 +5,7 @@ import { isDeleteAllowed } from '../utils/safety.js';
 import { logAudit } from '../utils/audit-log.js';
 import { createBatch, claimBatch, BatchOperation } from '../utils/batch-store.js';
 import { getTransferCategoryId } from '../utils/transfer-category.js';
+import { getReconciliationCategoryId } from '../utils/reconciliation-category.js';
 
 /* ------------------------------------------------------------------------- */
 /* Tool schemas                                                              */
@@ -211,7 +212,7 @@ export function setupEntryTools() {
         {
             name: 'entry_batch_preview',
             description:
-                'Preview a batch of entry write operations (create / update / manage / split). ' +
+                'Preview a batch of write operations (create / update / manage / split). ' +
                 'Validates every operation, returns a confirmation token valid for 5 minutes, ' +
                 'and does NOT call the Toshl API. Use entry_batch_commit with the returned token to execute.',
             inputSchema: {
@@ -224,7 +225,8 @@ export function setupEntryTools() {
                             'For "create", data matches entry-create shape (amount, currency, date, account, category, ...). ' +
                             'For "update", data must include id plus the fields to change. ' +
                             'For "manage", data matches the bulk-management shape (with, set, add, remove). ' +
-                            'For "split", data is { id, friend_account, share_amount|equal, transfer_desc? } — reduces the original expense to the user\'s portion and creates a transfer for the friend\'s share.',
+                            'For "split", data is { id, friend_account, share_amount|equal, transfer_desc? } — reduces the original expense to the user\'s portion and creates a transfer for the friend\'s share. ' +
+                            'NOTE: Toshl\'s system Reconciliation category is not writable via the public API — attempts to attach it via create/update are rejected at preview. Balance-correction on a custom account is app-only.',
                         items: {
                             type: 'object',
                             properties: {
@@ -242,10 +244,11 @@ export function setupEntryTools() {
         {
             name: 'entry_batch_commit',
             description:
-                'Execute a previously-previewed batch of entry operations. ' +
+                'Execute a previously-previewed batch of operations ATOMICALLY. ' +
                 'Requires the confirmation_token returned by entry_batch_preview. ' +
-                'Operations run sequentially; one operation failing does not abort the rest — ' +
-                'the response reports per-operation success/failure.',
+                'Operations run sequentially and STOP on the first failure — ' +
+                'the response reports which ops committed, which one failed, and which never ran. ' +
+                'No auto-rollback: earlier successful ops stay applied and must be reversed manually if needed.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -391,7 +394,28 @@ export async function handleEntryTimelineTool(args: any) {
 /* Per-op validation                                                         */
 /* ------------------------------------------------------------------------- */
 
-function validateCreateData(data: any): string | null {
+const RECONCILE_HINT =
+    'category is the system Reconciliation category, which Toshl does not expose for writes via the public API. ' +
+    'There is no reconcile action — the balancing-plug workaround is a normal entry in one of your own categories ' +
+    '(e.g. Unrealized P&L) sized so the account balance matches the target after Toshl recalculates.';
+
+async function isReconciliationCategory(category: unknown): Promise<boolean> {
+    if (typeof category !== 'string' || category.length === 0) return false;
+    if (/^reconc/i.test(category)) return true;
+    try {
+        const reconcileId = await getReconciliationCategoryId();
+        if (reconcileId && category === reconcileId) return true;
+    } catch (e) {
+        // Category lookup failed — degrade gracefully. Commit-time attempts to
+        // write the reconciliation category will still fail with 400/403.
+        logger.debug('Reconciliation category lookup failed during preview', {
+            error: (e as Error).message,
+        });
+    }
+    return false;
+}
+
+async function validateCreateData(data: any): Promise<string | null> {
     if (!data || typeof data !== 'object') return 'data must be an object';
     if (typeof data.amount !== 'number') return 'amount must be a number';
     if (!data.currency || typeof data.currency !== 'object') return 'currency is required';
@@ -402,10 +426,11 @@ function validateCreateData(data: any): string | null {
     if (!data.date) return 'date is required';
     if (!data.account) return 'account is required';
     if (!data.category) return 'category is required';
+    if (await isReconciliationCategory(data.category)) return RECONCILE_HINT;
     return null;
 }
 
-function validateUpdateData(data: any): string | null {
+async function validateUpdateData(data: any): Promise<string | null> {
     if (!data || typeof data !== 'object') return 'data must be an object';
     if (!data.id) return 'id is required';
     if (typeof data.amount !== 'undefined' && typeof data.amount !== 'number') {
@@ -418,8 +443,12 @@ function validateUpdateData(data: any): string | null {
     ) {
         return 'currency.rate must be a number if provided';
     }
+    if (data.category !== undefined && (await isReconciliationCategory(data.category))) {
+        return RECONCILE_HINT;
+    }
     return null;
 }
+
 
 function validateManageData(data: any): string | null {
     if (!data || typeof data !== 'object') return 'data must be an object';
@@ -672,10 +701,10 @@ export async function handleEntryBatchPreview(args: any) {
         let validationError: string | null;
         switch (op.action) {
             case 'create':
-                validationError = validateCreateData(op.data);
+                validationError = await validateCreateData(op.data);
                 break;
             case 'update':
-                validationError = validateUpdateData(op.data);
+                validationError = await validateUpdateData(op.data);
                 break;
             case 'manage':
                 validationError = validateManageData(op.data);
@@ -732,9 +761,32 @@ export async function handleEntryBatchCommit(args: any) {
         return errorResponse(msg);
     }
 
-    const results: Array<{ index: number; action: string } & OpOutcome> = [];
+    // Atomic semantics: run ops sequentially, STOP on first failure. No
+    // auto-rollback of already-committed ops — they stay applied. The result
+    // reports which ops committed, which one failed, and which never ran so
+    // the caller can reverse manually if needed.
+    type CommittedResult = { index: number; action: string; status: 'committed'; result: any };
+    type FailedResult = { index: number; action: string; status: 'failed'; error: string };
+    type SkippedResult = { index: number; action: string; status: 'skipped'; reason: string };
+    type OpResult = CommittedResult | FailedResult | SkippedResult;
+
+    const results: OpResult[] = [];
+    let aborted = false;
+    let failedIndex: number | null = null;
+
     for (let i = 0; i < claimed.operations.length; i++) {
         const op = claimed.operations[i];
+
+        if (aborted) {
+            results.push({
+                index: i,
+                action: op.action,
+                status: 'skipped',
+                reason: `not run: operation ${failedIndex} failed`,
+            });
+            continue;
+        }
+
         let outcome: OpOutcome;
         switch (op.action) {
             case 'create':
@@ -752,23 +804,34 @@ export async function handleEntryBatchCommit(args: any) {
             default:
                 outcome = { success: false, error: `unknown action: ${(op as any).action}` };
         }
-        results.push({ index: i, action: op.action, ...outcome });
+
+        if (outcome.success) {
+            results.push({ index: i, action: op.action, status: 'committed', result: outcome.result });
+        } else {
+            results.push({ index: i, action: op.action, status: 'failed', error: outcome.error });
+            aborted = true;
+            failedIndex = i;
+        }
     }
 
-    const successes = results.filter((r) => r.success).length;
-    const failures = results.length - successes;
+    const committed = results.filter((r) => r.status === 'committed').length;
+    const skipped = results.filter((r) => r.status === 'skipped').length;
 
     logAudit('commit', token, {
         total: results.length,
-        successes,
-        failures,
+        committed,
+        aborted,
+        failed_index: failedIndex,
+        skipped,
         results,
     });
 
     return textResponse({
         total: results.length,
-        successes,
-        failures,
+        committed,
+        aborted,
+        failed_index: failedIndex,
+        skipped,
         results,
     });
 }
